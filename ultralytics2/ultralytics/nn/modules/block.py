@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -49,7 +50,8 @@ __all__ = (
     "Attention",
     "PSA",
     "SCDown",
-    'Mamba'
+    'Mamba',
+    'SelectiveSSM'
 )
 
 
@@ -1108,107 +1110,101 @@ class SCDown(nn.Module):
         """Applies convolution and downsampling to the input tensor in the SCDown module."""
         return self.cv2(self.cv1(x))
 
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+
+    
+def segsum(x: torch.Tensor) -> torch.Tensor:
+    """Naive segment sum calculation for SSM."""
+    T = x.size(-1)
+    x_cumsum = torch.cumsum(x, dim=-1)
+    x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+    return x_segsum
 
 class SelectiveSSM(nn.Module):
-    """Selective State Space Model with hardware-aware sequence scan."""
-    
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank=None, dt_min=0.001, dt_max=0.1):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 64,
+        d_conv: int = 3,
+        expand: int = 2,
+        block_size: int = 64,
+        dropout: float = 0.1,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        use_conv: bool = True,
+    ):
         super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(expand * d_model)
         
-        # Projection matrices
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2)  # input projection, *2 for gating
-        self.out_proj = nn.Linear(self.d_inner, d_model)     # output projection
-        
-        # Convolution
-        self.conv = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            kernel_size=d_conv,
-            padding=d_conv - 1,
-            groups=self.d_inner
-        )
-        
-        # SSM parameters
-        self.A = nn.Parameter(torch.randn(self.d_inner, d_state))  # (E*D, N)
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-        
-        # Selective mechanisms
-        dt_rank = math.ceil(d_model / 16) if dt_rank is None else dt_rank
-        self.dt = nn.Parameter(torch.rand(dt_rank, self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
-        self.dt_proj = nn.Linear(d_model, dt_rank)
-        
-        # B and C selective projections 
-        self.B_proj = nn.Linear(d_model, d_state * self.d_inner)
-        self.C_proj = nn.Linear(d_model, d_state * self.d_inner)
+        self.d_model = int(d_model)
+        self.d_state = int(d_state)
+        self.d_conv = int(d_conv)
+        self.expand = int(expand)
+        self.d_inner = int(self.expand * self.d_model)
+        self.block_size = int(block_size)
+        self.use_conv = bool(use_conv)
 
-    def forward(self, x):
-        # Input projection and gating
-        x_and_gate = self.in_proj(x)  # (B, L, E*D*2)
-        x, gate = x_and_gate.chunk(2, dim=-1)
+        self.in_proj = nn.Conv2d(self.d_model, self.d_inner * 3, kernel_size=1)
+        if self.use_conv:
+            self.conv = nn.Conv2d(
+                self.d_inner,
+                self.d_inner,
+                kernel_size=self.d_conv,
+                padding=self.d_conv // 2,
+                groups=self.d_inner,
+                bias=False
+            )
         
-        # Local convolution
-        x_conv = self.conv(x.permute(0, 2, 1))[..., :x.size(1)]
-        x = x.permute(0, 2, 1) + x_conv
-        x = x.permute(0, 2, 1)
+        scale = 1.0 / math.sqrt(self.d_state)
+        self.B = nn.Parameter(torch.randn((self.d_inner, self.d_state)) * scale)
+        self.C = nn.Parameter(torch.randn((self.d_state, self.d_inner)) * scale)
         
-        # Compute selective SSM parameters
-        delta = torch.exp(self.dt_proj(x) @ self.dt)  # (B, L, E*D)
-        B = self.B_proj(x).view(*x.shape[:-1], self.d_inner, self.d_state)  # (B, L, E*D, N) 
-        C = self.C_proj(x).view(*x.shape[:-1], self.d_inner, self.d_state)  # (B, L, E*D, N)
-        
-        # Selective scan
-        x = self.selective_scan(x, delta, B, C)
-        
-        # Gating and output projection
-        x = x * F.silu(gate)
-        return self.out_proj(x)
+        dt_init = torch.rand(self.d_inner) * (dt_max - dt_min) + dt_min
+        self.dt = nn.Parameter(torch.log(dt_init))
 
-    def selective_scan(self, x, delta, B, C):
-        """
-        Parallel scan implementation that is computed in SRAM.
+        self.activation = nn.SiLU()
+        self.out_proj = nn.Conv2d(self.d_inner, self.d_model, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.in_proj.weight)
+        nn.init.zeros_(self.in_proj.bias)
         
-        Args:
-            x: Input tensor (B, L, D)
-            delta: Selective step sizes (B, L, D) 
-            B: Input projection (B, L, D, N)
-            C: Output projection (B, L, D, N)
-            
-        Returns:
-            y: Output tensor (B, L, D)
-        """
-        # NOTE: This is a simplified version. The actual implementation requires 
-        # careful kernel fusion and management of GPU memory hierarchies
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+        if self.use_conv:
+            nn.init.kaiming_normal_(self.conv.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+
+        if C != self.d_model:
+            raise ValueError(f"Input channels ({C}) don't match expected channels ({self.d_model})")
+
+        x_proj = self.in_proj(x)
+        x_ssm, delta, gate = x_proj.chunk(3, dim=1)
+
+        if self.use_conv:
+            x_ssm = self.conv(x_ssm)
+
+        A = -torch.exp(self.dt).view(1, -1, 1, 1) * delta.sigmoid()
         
-        batch_size, seq_len, dim = x.shape
-        out = []
-        
-        # Initialize state
-        h = torch.zeros(batch_size, dim, self.d_state, device=x.device)
-        
-        # Sequential scan for now (parallel scan would be implemented in CUDA)
-        for t in range(seq_len):
-            # Discretize continuous parameters
-            At = torch.diag_embed(torch.exp(-delta[:, t] * self.D)) @ self.A
-            Bt = B[:, t]
-            Ct = C[:, t]
-            
-            # State update
-            h = h @ At.transpose(-1, -2) + x[:, t:t+1] @ Bt
-            
-            # Output projection
-            y = h @ Ct.transpose(-1, -2)
-            out.append(y)
-            
-        return torch.cat(out, dim=1)
+        x_ssm = x_ssm.permute(0, 2, 3, 1)  # B, H, W, C
+        x_ssm = torch.einsum('bhwc,cd,ed->bhwe', x_ssm, self.B, self.C)
+        x_ssm = x_ssm.permute(0, 3, 1, 2)  # B, C, H, W
+        x_ssm = x_ssm * torch.exp(A)
+
+        x_ssm = self.activation(x_ssm)
+        x_ssm = x_ssm * gate.sigmoid()
+
+        x = self.out_proj(x_ssm)
+        x = self.dropout(x)
+
+        return x
 
 class Mamba(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):

@@ -57,7 +57,9 @@ from .block import (
     ResNetLayer,
     SCDown,
     Mamba,
+    SelectiveSSM,
 )
+
 from .conv import (
     CBAM,
     ChannelAttention,
@@ -158,4 +160,5 @@ __all__ = (
     "Attention",
     "PSA",
     "Mamba",
+    "SelectiveSSM",
 )
