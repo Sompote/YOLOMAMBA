@@ -58,6 +58,7 @@ from .block import (
     SCDown,
     Mamba,
     SelectiveSSM,
+    Mamba2,
 )
 
 from .conv import (

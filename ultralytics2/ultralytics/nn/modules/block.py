@@ -51,7 +51,8 @@ __all__ = (
     "PSA",
     "SCDown",
     'Mamba',
-    'SelectiveSSM'
+    'SelectiveSSM',
+    'Mamba2',
 )
 
 
@@ -1256,4 +1257,161 @@ class Mamba(nn.Module):
         elif len(original_shape) == 2:
             x = x.squeeze(1)
 
+        return x
+
+class MambaBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_rank: int = None,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = dt_rank if dt_rank is not None else math.ceil(self.d_inner / 16)
+
+        # Projects input to higher dimension
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2)
+
+        # Convolution for local context
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=d_conv,
+            padding=d_conv - 1,
+            groups=self.d_inner,
+        )
+
+        # SSM parameters
+        scale = 1.0 / math.sqrt(self.d_state)
+        self.A = nn.Parameter(torch.randn(self.d_inner, self.d_state, self.d_state) * scale)
+        self.B = nn.Parameter(torch.randn(self.d_inner, self.d_state) * scale)
+        self.C = nn.Parameter(torch.randn(self.d_inner, self.d_state) * scale)
+        
+        # dt projection
+        if dt_rank is None:
+            self.dt = nn.Parameter(torch.rand(self.d_inner) * (dt_max - dt_min) + dt_min)
+        else:
+            self.dt_projs = nn.Parameter(torch.randn(dt_rank, self.d_inner))
+
+        # Output projection
+        self.out_proj = nn.Linear(self.d_inner, d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+        self.activation = nn.SiLU()
+        
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.normal_(self.in_proj.weight, std=0.02)
+        nn.init.zeros_(self.in_proj.bias)
+        nn.init.normal_(self.out_proj.weight, std=0.02)
+        nn.init.zeros_(self.out_proj.bias)
+        nn.init.normal_(self.conv1d.weight, std=0.02)
+
+    def ssm_scan(self, x: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """
+        Parallel scan implementation of SSM
+        x: (batch, length, d_inner)
+        delta: (batch, length, d_inner)
+        """
+        # Initialize state
+        batch, length, _ = x.shape
+        h = torch.zeros(batch, self.d_state, device=x.device)
+        
+        # Discretize A using delta
+        dA = torch.exp(torch.einsum('bld,nds->blnds', delta.unsqueeze(-1).unsqueeze(-1), self.A))
+        dB = torch.einsum('bld,nd->bldn', delta, self.B)
+        
+        # Parallel scan
+        hs = []
+        for t in range(length):
+            h = torch.einsum('bnds,bs->bnd', dA[:, t], h) + \
+                torch.einsum('bnd,bd->bn', dB[:, t], x[:, t])
+            hs.append(h)
+        
+        hs = torch.stack(hs, dim=1)  # (batch, length, d_inner, d_state)
+        out = torch.einsum('blnd,nd->bln', hs, self.C)
+        
+        return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape
+
+        # Handle different input shapes
+        if x.dim() == 2:
+            B, D = x.shape
+            L = 1
+            x = x.unsqueeze(1)  # Add sequence dimension
+        elif x.dim() == 3:
+            B, L, D = x.shape
+        elif x.dim() == 4:
+            B, C, H, W = x.shape
+            L = H * W
+            D = C
+            x = x.view(B, C, -1).permute(0, 2, 1)  # (B, L, D)
+        else:
+            raise ValueError(f"Input tensor must be 2D, 3D, or 4D, but got shape {x.shape}")
+
+        # Existing code...
+        x_proj = self.in_proj(x)
+        x, res = x_proj.chunk(2, dim=-1)
+
+        x = x.permute(0, 2, 1)
+        x = self.conv1d(x)[..., :L]
+        x = x.permute(0, 2, 1)
+
+        x = self.activation(x)
+        x = x * res
+
+        x = self.out_proj(x)
+
+        # Reshape output to match input shape
+        if len(original_shape) == 4:
+            x = x.permute(0, 2, 1).view(original_shape)
+        elif len(original_shape) == 2:
+            x = x.squeeze(1)
+
+        return x
+
+class Mamba2(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        depth: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_rank: int = None,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            MambaBlock(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                dt_rank=dt_rank,
+                dt_min=dt_min,
+                dt_max=dt_max,
+                dropout=dropout
+            )
+            for _ in range(depth)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = x + layer(x)  # Residual connection
         return x
